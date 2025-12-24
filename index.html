@@ -30,7 +30,8 @@
         .btn-primary{background:linear-gradient(135deg,#FC94AF,#ff7096);color:white;box-shadow:0 4px 15px rgba(252,148,175,0.4);}
         .btn-secondary{background:#f8f8f8;color:#FC94AF;border:2px solid #FC94AF;}
         
-        #pdfInput{display:none;}
+        .file-input{display:none;}
+        .format-info{font-size:12px;color:#999;text-align:center;margin-top:8px;}
         
         #readerOverlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;z-index:10000;background:#000;touch-action:none;}
         #overlayTop,#overlayBottom{position:fixed;left:0;width:100%;background:rgba(0,0,0,0.95);pointer-events:none;}
@@ -80,9 +81,17 @@
         </div>
         
         <div class="section">
-            <div class="section-title">📄 טעינת קובץ PDF או תמונה</div>
+            <div class="section-title">📚 טעינת ספר אלקטרוני</div>
+            <button class="btn btn-secondary" id="ebookBtn">בחר ספר</button>
+            <input type="file" id="ebookInput" class="file-input" accept=".epub,.mobi,.fb2,.txt">
+            <div class="format-info">EPUB, MOBI, FB2, TXT</div>
+        </div>
+        
+        <div class="section">
+            <div class="section-title">📄 טעינת PDF או תמונה</div>
             <button class="btn btn-secondary" id="pdfBtn">בחר קובץ</button>
-            <input type="file" id="pdfInput" accept=".pdf,image/*">
+            <input type="file" id="pdfInput" class="file-input" accept=".pdf,image/*">
+            <div class="format-info">PDF, JPG, PNG</div>
         </div>
     </div>
 
@@ -94,7 +103,7 @@
             <div id="lineCounter">שורה 1 / 1</div>
             <div class="pageSliderContainer" id="pageSliderContainer">
                 <input type="range" id="pageSlider" min="1" max="1" value="1">
-                <div id="pageLabel">עמוד 1 / 1</div>
+                <div id="pageLabel">פרק 1 / 1</div>
             </div>
             <div class="controlRow">
                 <button class="zoomBtn" id="zoomOutBtn">−</button>
@@ -112,15 +121,16 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
     <script>pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';</script>
     <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <script>
         var lines = [];
         var currentLine = 0;
         var fontSize = 22;
-        var isPdf = false;
-        var pdfPages = [];
-        var currentPage = 0;
+        var hasChapters = false;
+        var chapters = [];
+        var currentChapter = 0;
         
-        // Advanced image preprocessing for maximum OCR accuracy
+        // Image preprocessing for OCR
         function preprocessImage(canvas) {
             const ctx = canvas.getContext('2d');
             const width = canvas.width;
@@ -128,163 +138,190 @@
             const imageData = ctx.getImageData(0, 0, width, height);
             const data = imageData.data;
             
-            // Step 1: Convert to grayscale
             const grayData = new Uint8Array(width * height);
             for (let i = 0, j = 0; i < data.length; i += 4, j++) {
                 grayData[j] = Math.round(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
             }
             
-            // Step 2: Calculate histogram for adaptive thresholding
+            // Otsu's threshold
             const histogram = new Array(256).fill(0);
-            for (let i = 0; i < grayData.length; i++) {
-                histogram[grayData[i]]++;
-            }
+            for (let i = 0; i < grayData.length; i++) histogram[grayData[i]]++;
             
-            // Step 3: Otsu's method for optimal threshold
-            let total = grayData.length;
-            let sum = 0;
+            let total = grayData.length, sum = 0;
             for (let i = 0; i < 256; i++) sum += i * histogram[i];
             
-            let sumB = 0, wB = 0, wF = 0;
-            let maxVariance = 0, threshold = 128;
-            
+            let sumB = 0, wB = 0, maxVariance = 0, threshold = 128;
             for (let i = 0; i < 256; i++) {
                 wB += histogram[i];
                 if (wB === 0) continue;
-                wF = total - wB;
+                let wF = total - wB;
                 if (wF === 0) break;
-                
                 sumB += i * histogram[i];
-                let mB = sumB / wB;
-                let mF = (sum - sumB) / wF;
-                let variance = wB * wF * (mB - mF) * (mB - mF);
-                
-                if (variance > maxVariance) {
-                    maxVariance = variance;
-                    threshold = i;
-                }
+                let variance = wB * wF * Math.pow((sumB / wB) - ((sum - sumB) / wF), 2);
+                if (variance > maxVariance) { maxVariance = variance; threshold = i; }
             }
             
-            // Step 4: Apply Gaussian blur for noise reduction (3x3 kernel)
-            const blurred = new Uint8Array(width * height);
-            const kernel = [1, 2, 1, 2, 4, 2, 1, 2, 1];
-            const kernelSum = 16;
-            
-            for (let y = 1; y < height - 1; y++) {
-                for (let x = 1; x < width - 1; x++) {
-                    let sum = 0;
-                    let k = 0;
-                    for (let ky = -1; ky <= 1; ky++) {
-                        for (let kx = -1; kx <= 1; kx++) {
-                            sum += grayData[(y + ky) * width + (x + kx)] * kernel[k++];
-                        }
-                    }
-                    blurred[y * width + x] = Math.round(sum / kernelSum);
-                }
-            }
-            
-            // Step 5: Adaptive local thresholding with Otsu threshold as base
-            const blockSize = 15;
-            const C = 5; // Constant subtracted from mean
-            
+            // Apply threshold with local adaptation
+            const blockSize = 15, C = 5;
             for (let y = 0; y < height; y++) {
                 for (let x = 0; x < width; x++) {
                     const idx = y * width + x;
-                    
-                    // Calculate local mean
-                    let localSum = 0;
-                    let count = 0;
-                    const halfBlock = Math.floor(blockSize / 2);
-                    
-                    for (let by = Math.max(0, y - halfBlock); by <= Math.min(height - 1, y + halfBlock); by++) {
-                        for (let bx = Math.max(0, x - halfBlock); bx <= Math.min(width - 1, x + halfBlock); bx++) {
-                            localSum += blurred[by * width + bx];
-                            count++;
+                    let localSum = 0, count = 0;
+                    const half = Math.floor(blockSize / 2);
+                    for (let by = Math.max(0, y - half); by <= Math.min(height - 1, y + half); by++) {
+                        for (let bx = Math.max(0, x - half); bx <= Math.min(width - 1, x + half); bx++) {
+                            localSum += grayData[by * width + bx]; count++;
                         }
                     }
-                    
-                    const localMean = localSum / count;
-                    const localThreshold = Math.min(localMean - C, threshold);
-                    
-                    // Apply threshold
-                    const value = blurred[idx] > localThreshold ? 255 : 0;
-                    
+                    const localThreshold = Math.min((localSum / count) - C, threshold);
+                    const value = grayData[idx] > localThreshold ? 255 : 0;
                     const i = idx * 4;
-                    data[i] = value;
-                    data[i + 1] = value;
-                    data[i + 2] = value;
-                    data[i + 3] = 255;
+                    data[i] = data[i + 1] = data[i + 2] = value;
                 }
             }
-            
-            // Step 6: Morphological operations - remove small noise
-            const cleaned = new Uint8Array(width * height);
-            for (let y = 1; y < height - 1; y++) {
-                for (let x = 1; x < width - 1; x++) {
-                    const idx = y * width + x;
-                    const pixel = data[idx * 4];
-                    
-                    // Count neighbors
-                    let blackNeighbors = 0;
-                    for (let dy = -1; dy <= 1; dy++) {
-                        for (let dx = -1; dx <= 1; dx++) {
-                            if (dx === 0 && dy === 0) continue;
-                            if (data[((y + dy) * width + (x + dx)) * 4] === 0) blackNeighbors++;
-                        }
-                    }
-                    
-                    // Remove isolated pixels
-                    if (pixel === 0 && blackNeighbors < 2) {
-                        cleaned[idx] = 255;
-                    } else if (pixel === 255 && blackNeighbors > 6) {
-                        cleaned[idx] = 0;
-                    } else {
-                        cleaned[idx] = pixel;
-                    }
-                }
-            }
-            
-            // Apply cleaned data
-            for (let i = 0; i < cleaned.length; i++) {
-                const idx = i * 4;
-                data[idx] = cleaned[i];
-                data[idx + 1] = cleaned[i];
-                data[idx + 2] = cleaned[i];
-            }
-            
             ctx.putImageData(imageData, 0, 0);
-            
-            // Step 7: Sharpen edges
-            const sharpened = ctx.getImageData(0, 0, width, height);
-            const sharpData = sharpened.data;
-            const sharpenKernel = [0, -1, 0, -1, 5, -1, 0, -1, 0];
-            
-            for (let y = 1; y < height - 1; y++) {
-                for (let x = 1; x < width - 1; x++) {
-                    let sum = 0;
-                    let k = 0;
-                    for (let ky = -1; ky <= 1; ky++) {
-                        for (let kx = -1; kx <= 1; kx++) {
-                            sum += data[((y + ky) * width + (x + kx)) * 4] * sharpenKernel[k++];
-                        }
-                    }
-                    const value = Math.max(0, Math.min(255, sum));
-                    const idx = (y * width + x) * 4;
-                    sharpData[idx] = value;
-                    sharpData[idx + 1] = value;
-                    sharpData[idx + 2] = value;
-                }
-            }
-            
-            ctx.putImageData(sharpened, 0, 0);
             return canvas;
         }
         
-        // Deskew detection (simple version)
-        function detectSkew(canvas) {
-            // This is a simplified skew detection
-            // For production, you'd use Hough transform
-            return 0; // Return 0 for now
+        // EPUB Parser
+        async function parseEPUB(file) {
+            const zip = await JSZip.loadAsync(file);
+            const chapters = [];
+            
+            // Find container.xml
+            const containerXml = await zip.file('META-INF/container.xml')?.async('text');
+            if (!containerXml) throw new Error('Invalid EPUB: no container.xml');
+            
+            // Get rootfile path
+            const rootfileMatch = containerXml.match(/full-path="([^"]+)"/);
+            if (!rootfileMatch) throw new Error('Invalid EPUB: no rootfile');
+            const rootfilePath = rootfileMatch[1];
+            const rootDir = rootfilePath.substring(0, rootfilePath.lastIndexOf('/') + 1);
+            
+            // Parse OPF
+            const opfContent = await zip.file(rootfilePath)?.async('text');
+            if (!opfContent) throw new Error('Invalid EPUB: no OPF file');
+            
+            // Get spine items
+            const spineMatches = opfContent.matchAll(/idref="([^"]+)"/g);
+            const manifestMatches = opfContent.matchAll(/id="([^"]+)"[^>]*href="([^"]+)"[^>]*media-type="application\/xhtml\+xml"/g);
+            
+            const manifest = {};
+            for (const match of manifestMatches) {
+                manifest[match[1]] = match[2];
+            }
+            
+            const spineIds = [];
+            for (const match of spineMatches) {
+                spineIds.push(match[1]);
+            }
+            
+            // Read each chapter
+            for (const id of spineIds) {
+                const href = manifest[id];
+                if (!href) continue;
+                
+                const filePath = rootDir + href;
+                const content = await zip.file(filePath)?.async('text');
+                if (!content) continue;
+                
+                // Extract text from HTML
+                const text = extractTextFromHTML(content);
+                if (text.length > 10) {
+                    chapters.push({
+                        title: 'פרק ' + (chapters.length + 1),
+                        lines: text.split('\n').filter(l => l.trim().length > 0)
+                    });
+                }
+            }
+            
+            return chapters;
+        }
+        
+        // MOBI/FB2/TXT Parser
+        async function parseOtherFormats(file) {
+            const text = await file.text();
+            const chapters = [];
+            
+            if (file.name.endsWith('.fb2')) {
+                // FB2 is XML
+                const bodyMatch = text.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+                if (bodyMatch) {
+                    const sections = bodyMatch[1].split(/<section/i);
+                    for (let i = 1; i < sections.length; i++) {
+                        const sectionText = extractTextFromHTML('<section' + sections[i]);
+                        if (sectionText.length > 10) {
+                            chapters.push({
+                                title: 'פרק ' + chapters.length + 1,
+                                lines: sectionText.split('\n').filter(l => l.trim().length > 0)
+                            });
+                        }
+                    }
+                }
+            } else {
+                // Plain text or MOBI (basic)
+                const cleanText = text.replace(/<[^>]+>/g, '\n').replace(/\r\n/g, '\n');
+                const paragraphs = cleanText.split(/\n\s*\n/).filter(p => p.trim().length > 0);
+                
+                // Split into chapters (every ~50 paragraphs or by chapter markers)
+                let currentChapter = [];
+                let chapterNum = 0;
+                
+                for (const para of paragraphs) {
+                    const isChapterHeader = /^(פרק|חלק|section|chapter)\s*[\dא-ת]/i.test(para.trim());
+                    
+                    if (isChapterHeader && currentChapter.length > 0) {
+                        chapters.push({
+                            title: 'פרק ' + (++chapterNum),
+                            lines: currentChapter
+                        });
+                        currentChapter = [];
+                    }
+                    
+                    currentChapter.push(...para.split('\n').filter(l => l.trim().length > 0));
+                    
+                    if (currentChapter.length > 200 && !isChapterHeader) {
+                        chapters.push({
+                            title: 'פרק ' + (++chapterNum),
+                            lines: currentChapter
+                        });
+                        currentChapter = [];
+                    }
+                }
+                
+                if (currentChapter.length > 0) {
+                    chapters.push({
+                        title: 'פרק ' + (++chapterNum),
+                        lines: currentChapter
+                    });
+                }
+            }
+            
+            return chapters.length > 0 ? chapters : [{
+                title: 'טקסט',
+                lines: text.split('\n').filter(l => l.trim().length > 0)
+            }];
+        }
+        
+        // Extract text from HTML
+        function extractTextFromHTML(html) {
+            return html
+                .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+                .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+                .replace(/<br\s*\/?>/gi, '\n')
+                .replace(/<\/p>/gi, '\n')
+                .replace(/<\/div>/gi, '\n')
+                .replace(/<\/h[1-6]>/gi, '\n')
+                .replace(/<[^>]+>/g, ' ')
+                .replace(/&nbsp;/g, ' ')
+                .replace(/&amp;/g, '&')
+                .replace(/&quot;/g, '"')
+                .replace(/&lt;/g, '<')
+                .replace(/&gt;/g, '>')
+                .replace(/&#(\d+);/g, (m, n) => String.fromCharCode(n))
+                .replace(/\s+/g, ' ')
+                .replace(/\n\s+/g, '\n')
+                .trim();
         }
         
         document.getElementById('pasteToggleBtn').onclick = function() {
@@ -309,12 +346,65 @@
             if (!text) { alert('אנא הדבק טקסט'); return; }
             lines = text.split('\n').filter(function(l) { return l.trim().length > 0; });
             if (lines.length === 0) { alert('לא נמצא טקסט'); return; }
-            isPdf = false;
+            hasChapters = false;
             document.getElementById('pageSliderContainer').classList.remove('show');
             document.getElementById('homeScreen').style.display = 'none';
             startReader();
         };
         
+        // Ebook button
+        document.getElementById('ebookBtn').onclick = function() {
+            document.getElementById('ebookInput').click();
+        };
+        
+        document.getElementById('ebookInput').onchange = async function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+            
+            document.getElementById('loading').style.display = 'flex';
+            document.getElementById('loadingText').textContent = 'טוען ספר...';
+            document.getElementById('loadingBar').style.width = '0%';
+            
+            try {
+                if (file.name.endsWith('.epub')) {
+                    document.getElementById('loadingText').textContent = 'מפענח EPUB...';
+                    chapters = await parseEPUB(file);
+                } else {
+                    document.getElementById('loadingText').textContent = 'קורא קובץ...';
+                    chapters = await parseOtherFormats(file);
+                }
+                
+                document.getElementById('loading').style.display = 'none';
+                
+                if (chapters.length === 0 || chapters[0].lines.length === 0) {
+                    alert('לא נמצא טקסט בספר');
+                    return;
+                }
+                
+                hasChapters = true;
+                currentChapter = 0;
+                lines = chapters[0].lines;
+                
+                // Setup slider
+                const slider = document.getElementById('pageSlider');
+                slider.min = 1;
+                slider.max = chapters.length;
+                slider.value = 1;
+                document.getElementById('pageLabel').textContent = chapters[0].title + ' / ' + chapters.length + ' פרקים';
+                document.getElementById('pageSliderContainer').classList.add('show');
+                
+                document.getElementById('homeScreen').style.display = 'none';
+                startReader();
+                
+            } catch(err) {
+                document.getElementById('loading').style.display = 'none';
+                alert('שגיאה בטעינת הספר: ' + err.message);
+            }
+            
+            e.target.value = '';
+        };
+        
+        // PDF button
         document.getElementById('pdfBtn').onclick = function() {
             document.getElementById('pdfInput').click();
         };
@@ -339,57 +429,33 @@
                         img.src = imageUrl;
                     });
                     
-                    // Create very high-res canvas (300 DPI equivalent)
                     const canvas = document.createElement('canvas');
-                    const targetDPI = 300;
-                    const scaleFactor = Math.max(1, (targetDPI / 72) * (3000 / Math.max(img.width, img.height)));
+                    const scaleFactor = Math.max(1, 3000 / Math.max(img.width, img.height));
                     canvas.width = Math.min(4000, img.width * scaleFactor);
                     canvas.height = Math.min(4000, img.height * scaleFactor);
                     
                     const ctx = canvas.getContext('2d');
-                    ctx.imageSmoothingEnabled = true;
-                    ctx.imageSmoothingQuality = 'high';
-                    
-                    // White background
                     ctx.fillStyle = 'white';
                     ctx.fillRect(0, 0, canvas.width, canvas.height);
                     ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
                     
                     URL.revokeObjectURL(imageUrl);
-                    
-                    document.getElementById('loadingText').textContent = 'מעבד תמונה...';
-                    document.getElementById('loadingBar').style.width = '20%';
-                    
-                    // Allow UI to update
-                    await new Promise(r => setTimeout(r, 50));
-                    
-                    // Preprocess
                     preprocessImage(canvas);
                     
                     document.getElementById('loadingText').textContent = 'סורק תמונה...';
-                    document.getElementById('loadingBar').style.width = '30%';
                     
                     const worker = await Tesseract.createWorker('heb', 1, {
                         logger: function(m) {
                             if (m.status === 'recognizing text') {
-                                const progress = 30 + Math.round(m.progress * 70);
-                                document.getElementById('loadingBar').style.width = progress + '%';
-                                document.getElementById('loadingText').textContent = 'סורק... ' + Math.round(m.progress * 100) + '%';
+                                document.getElementById('loadingBar').style.width = Math.round(m.progress * 100) + '%';
                             }
                         }
                     });
                     
-                    // Maximum accuracy settings
                     await worker.setParameters({
                         tessedit_pageseg_mode: '6',
-                        tessedit_ocr_engine_mode: '3', // LSTM + Legacy
+                        tessedit_ocr_engine_mode: '3',
                         preserve_interword_spaces: '1',
-                        textord_heavy_nr: '1',
-                        edges_max_children_per_outline: '40',
-                        tessedit_char_blacklist: '|{}[]<>~`@#$%^&*_+=\\',
-                        paragraph_text_based: '1',
-                        textord_force_make_prop_words: '0',
-                        tessedit_write_params_to_file: '',
                     });
                     
                     const { data } = await worker.recognize(canvas);
@@ -397,25 +463,12 @@
                     
                     document.getElementById('loading').style.display = 'none';
                     
-                    // Advanced text cleanup
-                    let text = data.text;
-                    
-                    // Fix common Hebrew OCR errors
-                    text = text.replace(/\u05F3/g, "'"); // Geresh to apostrophe
-                    text = text.replace(/\u05F4/g, '"'); // Gershayim to quote
-                    text = text.replace(/[\u200B-\u200F\uFEFF]/g, ''); // Remove invisible chars
-                    text = text.replace(/\s+/g, ' ');
-                    text = text.replace(/([.!?:;,])\s*/g, '$1\n');
-                    text = text.replace(/\n\s*\n/g, '\n');
-                    
+                    let text = data.text.replace(/\s+/g, ' ').replace(/([.!?:;,])\s*/g, '$1\n');
                     lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 1);
                     
-                    if (lines.length === 0) { 
-                        alert('לא נמצא טקסט בתמונה'); 
-                        return; 
-                    }
+                    if (lines.length === 0) { alert('לא נמצא טקסט'); return; }
                     
-                    isPdf = false;
+                    hasChapters = false;
                     document.getElementById('pageSliderContainer').classList.remove('show');
                     document.getElementById('homeScreen').style.display = 'none';
                     startReader();
@@ -428,7 +481,7 @@
                 return;
             }
             
-            // PDF Processing
+            // PDF
             document.getElementById('loadingText').textContent = 'טוען PDF...';
             
             try {
@@ -436,90 +489,60 @@
                 const pdf = await pdfjsLib.getDocument({data: arrayBuffer}).promise;
                 const totalPages = pdf.numPages;
                 
-                pdfPages = [];
+                chapters = [];
                 let ocrWorker = null;
                 
                 for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
                     const progress = Math.round((pageNum / totalPages) * 100);
                     document.getElementById('loadingBar').style.width = progress + '%';
-                    document.getElementById('loadingText').textContent = 'מעבד עמוד ' + pageNum + ' מתוך ' + totalPages;
+                    document.getElementById('loadingText').textContent = 'עמוד ' + pageNum + ' / ' + totalPages;
                     
                     const page = await pdf.getPage(pageNum);
-                    
-                    // First try to extract text directly
                     const textContent = await page.getTextContent();
                     let pageText = textContent.items.map(item => item.str).join(' ').trim();
                     
-                    // If no text or very little text, use OCR
                     if (pageText.length < 50) {
-                        document.getElementById('loadingText').textContent = 'סורק עמוד ' + pageNum + ' (OCR)...';
-                        
-                        // Render at very high resolution
-                        const scale = 4.0; // Maximum quality
-                        const viewport = page.getViewport({scale: scale});
+                        const scale = 4.0;
+                        const viewport = page.getViewport({scale});
                         const canvas = document.createElement('canvas');
-                        const context = canvas.getContext('2d');
                         canvas.width = viewport.width;
                         canvas.height = viewport.height;
-                        
-                        context.fillStyle = 'white';
-                        context.fillRect(0, 0, canvas.width, canvas.height);
-                        
-                        await page.render({
-                            canvasContext: context,
-                            viewport: viewport
-                        }).promise;
-                        
-                        // Preprocess
+                        const ctx = canvas.getContext('2d');
+                        ctx.fillStyle = 'white';
+                        ctx.fillRect(0, 0, canvas.width, canvas.height);
+                        await page.render({canvasContext: ctx, viewport}).promise;
                         preprocessImage(canvas);
                         
                         if (!ocrWorker) {
                             ocrWorker = await Tesseract.createWorker('heb', 1);
-                            await ocrWorker.setParameters({
-                                tessedit_pageseg_mode: '6',
-                                tessedit_ocr_engine_mode: '3',
-                                preserve_interword_spaces: '1',
-                                textord_heavy_nr: '1',
-                                tessedit_char_blacklist: '|{}[]<>~`@#$%^&*_+=\\',
-                            });
+                            await ocrWorker.setParameters({tessedit_pageseg_mode: '6', tessedit_ocr_engine_mode: '3'});
                         }
-                        
                         const { data } = await ocrWorker.recognize(canvas);
                         pageText = data.text;
                     }
                     
-                    // Clean up
-                    pageText = pageText.replace(/[\u200B-\u200F\uFEFF]/g, '');
-                    pageText = pageText.replace(/\s+/g, ' ').trim();
                     const pageLines = pageText.split(/[.\n]/).map(l => l.trim()).filter(l => l.length > 2);
-                    
-                    pdfPages.push({
-                        pageNum: pageNum,
-                        lines: pageLines
-                    });
+                    chapters.push({title: 'עמוד ' + pageNum, lines: pageLines});
                 }
                 
-                if (ocrWorker) {
-                    await ocrWorker.terminate();
-                }
+                if (ocrWorker) await ocrWorker.terminate();
                 
                 document.getElementById('loading').style.display = 'none';
                 
-                const totalLines = pdfPages.reduce((sum, p) => sum + p.lines.length, 0);
-                if (totalLines === 0) { 
-                    alert('לא נמצא טקסט ב-PDF'); 
-                    return; 
+                if (chapters.every(c => c.lines.length === 0)) {
+                    alert('לא נמצא טקסט ב-PDF');
+                    return;
                 }
                 
-                isPdf = true;
-                currentPage = 0;
-                lines = pdfPages[0].lines.length > 0 ? pdfPages[0].lines : ['(עמוד ריק)'];
+                hasChapters = true;
+                currentChapter = 0;
+                lines = chapters[0].lines.length > 0 ? chapters[0].lines : ['(עמוד ריק)'];
                 
                 const slider = document.getElementById('pageSlider');
                 slider.min = 1;
-                slider.max = pdfPages.length;
+                slider.max = chapters.length;
                 slider.value = 1;
-                document.getElementById('pageLabel').textContent = 'עמוד 1 / ' + pdfPages.length;
+                document.getElementById('pageLabel').textContent = 'עמוד 1 / ' + chapters.length;
                 document.getElementById('pageSliderContainer').classList.add('show');
                 
                 document.getElementById('homeScreen').style.display = 'none';
@@ -527,18 +550,18 @@
                 
             } catch(err) {
                 document.getElementById('loading').style.display = 'none';
-                alert('שגיאה בטעינת PDF: ' + err.message);
+                alert('שגיאה: ' + err.message);
             }
-            
             e.target.value = '';
         };
         
+        // Chapter slider
         document.getElementById('pageSlider').oninput = function() {
-            var pageNum = parseInt(this.value);
-            currentPage = pageNum - 1;
-            lines = pdfPages[currentPage].lines.length > 0 ? pdfPages[currentPage].lines : ['(עמוד ריק)'];
+            const num = parseInt(this.value);
+            currentChapter = num - 1;
+            lines = chapters[currentChapter].lines.length > 0 ? chapters[currentChapter].lines : ['(ריק)'];
             currentLine = 0;
-            document.getElementById('pageLabel').textContent = 'עמוד ' + pageNum + ' / ' + pdfPages.length;
+            document.getElementById('pageLabel').textContent = chapters[currentChapter].title + ' / ' + chapters.length;
             updateDisplay();
         };
         
@@ -550,7 +573,7 @@
         
         function updateDisplay() {
             if (lines.length === 0) {
-                document.getElementById('textLine').textContent = '(עמוד ריק)';
+                document.getElementById('textLine').textContent = '(ריק)';
                 document.getElementById('lineCounter').textContent = 'שורה 0 / 0';
                 return;
             }
@@ -559,7 +582,7 @@
             if (currentLine >= lines.length) currentLine = lines.length - 1;
             
             var h = window.innerHeight;
-            var controlsHeight = isPdf ? 220 : 160;
+            var controlsHeight = hasChapters ? 220 : 160;
             var availableHeight = h - controlsHeight;
             var centerY = availableHeight / 2;
             var lineHeight = 90;
@@ -581,12 +604,12 @@
             if (currentLine < lines.length - 1) {
                 currentLine++;
                 updateDisplay();
-            } else if (isPdf && currentPage < pdfPages.length - 1) {
-                currentPage++;
-                lines = pdfPages[currentPage].lines.length > 0 ? pdfPages[currentPage].lines : ['(עמוד ריק)'];
+            } else if (hasChapters && currentChapter < chapters.length - 1) {
+                currentChapter++;
+                lines = chapters[currentChapter].lines.length > 0 ? chapters[currentChapter].lines : ['(ריק)'];
                 currentLine = 0;
-                document.getElementById('pageSlider').value = currentPage + 1;
-                document.getElementById('pageLabel').textContent = 'עמוד ' + (currentPage + 1) + ' / ' + pdfPages.length;
+                document.getElementById('pageSlider').value = currentChapter + 1;
+                document.getElementById('pageLabel').textContent = chapters[currentChapter].title + ' / ' + chapters.length;
                 updateDisplay();
             }
         }
@@ -595,12 +618,12 @@
             if (currentLine > 0) {
                 currentLine--;
                 updateDisplay();
-            } else if (isPdf && currentPage > 0) {
-                currentPage--;
-                lines = pdfPages[currentPage].lines.length > 0 ? pdfPages[currentPage].lines : ['(עמוד ריק)'];
+            } else if (hasChapters && currentChapter > 0) {
+                currentChapter--;
+                lines = chapters[currentChapter].lines.length > 0 ? chapters[currentChapter].lines : ['(ריק)'];
                 currentLine = lines.length - 1;
-                document.getElementById('pageSlider').value = currentPage + 1;
-                document.getElementById('pageLabel').textContent = 'עמוד ' + (currentPage + 1) + ' / ' + pdfPages.length;
+                document.getElementById('pageSlider').value = currentChapter + 1;
+                document.getElementById('pageLabel').textContent = chapters[currentChapter].title + ' / ' + chapters.length;
                 updateDisplay();
             }
         }
@@ -615,13 +638,11 @@
             document.getElementById('pasteArea').style.display = 'none';
             document.getElementById('readPastedBtn').style.display = 'none';
             document.getElementById('pasteToggleBtn').textContent = 'פתח שדה טקסט';
-            isPdf = false;
-            pdfPages = [];
+            hasChapters = false;
+            chapters = [];
         };
         
-        var touchStartY = 0;
-        var touchStartTime = 0;
-        var isSwiping = false;
+        var touchStartY = 0, touchStartTime = 0, isSwiping = false;
         
         document.getElementById('readerOverlay').addEventListener('touchstart', function(e) {
             if (e.target.closest('#controls')) return;
@@ -631,22 +652,14 @@
         }, {passive: true});
         
         document.getElementById('readerOverlay').addEventListener('touchmove', function(e) {
-            if (isSwiping && !e.target.closest('#controls')) {
-                e.preventDefault();
-            }
+            if (isSwiping && !e.target.closest('#controls')) e.preventDefault();
         }, {passive: false});
         
         document.getElementById('readerOverlay').addEventListener('touchend', function(e) {
-            if (!isSwiping) return;
-            if (e.target.closest('#controls')) return;
-            
-            var touchEndY = e.changedTouches[0].clientY;
-            var diff = touchStartY - touchEndY;
-            var timeDiff = Date.now() - touchStartTime;
-            
-            if (timeDiff < 500 && Math.abs(diff) > 50) {
-                if (diff > 0) nextLine();
-                else prevLine();
+            if (!isSwiping || e.target.closest('#controls')) return;
+            var diff = touchStartY - e.changedTouches[0].clientY;
+            if (Date.now() - touchStartTime < 500 && Math.abs(diff) > 50) {
+                if (diff > 0) nextLine(); else prevLine();
             }
             isSwiping = false;
         }, {passive: true});
@@ -655,7 +668,7 @@
             if (document.getElementById('readerOverlay').style.display !== 'block') return;
             if (e.key === 'ArrowDown') { nextLine(); e.preventDefault(); }
             else if (e.key === 'ArrowUp') { prevLine(); e.preventDefault(); }
-            else if (e.key === 'Escape') { document.getElementById('closeBtn').click(); }
+            else if (e.key === 'Escape') document.getElementById('closeBtn').click();
         };
         
         window.onresize = function() {
